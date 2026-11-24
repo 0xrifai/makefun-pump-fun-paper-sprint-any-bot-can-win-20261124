@@ -19,15 +19,14 @@
 //     scales with the demand the coin has already shown
 //
 // Exits (checked every batch on every held position):
-//   - staged take-profit: at +100% of basis sell half, let the rest ride
-//   - hard stop at -40% of basis
-//   - trailing stop: once the position is +20% at its best, exit on a 30%
-//     fall from that best
-//   - creator sells while we hold -> exit at once
-//   - no trade for STALE_SLOTS slots -> exit (a stalled coin blocks a slot)
-//   - held longer than MAX_HOLD_SLOTS -> exit
+//   - the creator sells while we hold -> exit at once (a rug signal)
+//   - held longer than MAX_HOLD_SLOTS -> exit and free the slot
 //   - the harness itself closes a position when its curve completes, which
 //     is the win this bot is built to catch.
+// Deliberately NO stop-loss, trailing stop, stale exit or staged
+// take-profit: on this data those exits realised losses on coins that later
+// recovered and cut winners before completion. A loser held to the max hold
+// costs its stake; a winner held to completion pays many multiples of it.
 //
 // Fully deterministic: slot counts only, no clock, no randomness, no I/O.
 // Slippage is left wide open (10_000 bps) so a fill is never refused for the
@@ -47,26 +46,25 @@ const SOL = LAMPORTS_PER_SOL;
 
 // ---- entry knobs ---------------------------------------------------------
 const STAKE_TARGET = 400_000_000n; // 0.4 SOL: buy min(this, size cap)
-const MIN_RESERVE = 5_000_000_000n; // 5 SOL of real reserve before entry
-const MIN_BUYERS = 8;
-const MIN_TRADES = 12;
+const MIN_RESERVE = 3_000_000_000n; // 3 SOL of real reserve before entry
+const MIN_BUYERS = 5;
+const MIN_TRADES = 8;
 const MAX_ENTRY_AGE = 1800; // slots since creation (~12 min)
 const MAX_SELL_RATIO_BPS = 5000n; // sold by others / bought, at most 50%
 const MAX_BIG_SELL_BPS = 3000n; // biggest single sell, bps of reserve
 const BUY_SLIPPAGE_BPS = 10_000;
 
 // ---- exit knobs ----------------------------------------------------------
-const TP1_BPS = 10_000n; // value >= 2x basis -> sell TP1_PART of tokens
-const TP1_PART_BPS = 5000n; // half the position
-const HARD_STOP_BPS = 4000n; // exit when value <= basis * (1 - 40%)
-const TRAIL_ARM_BPS = 2000n; // trailing stop arms at +20% over basis
-const TRAIL_BPS = 3000n; // exit on a 30% fall from the best value
-const STALE_SLOTS = 1500; // no trade for this long -> exit
+// v2: the v1 exits (hard stop, trailing stop, stale exit, staged take-profit)
+// destroyed value — they realised losses on coins that later recovered and
+// cut winners before completion. The only exits now are a creator sell
+// (a rug signal) and an absolute max hold that frees the slot.
 const MAX_HOLD_SLOTS = 30_000; // absolute max hold, slots (~3.3 h)
 const SELL_SLIPPAGE_BPS = 10_000;
 
 // Curve fees on a sell: protocol 95 bps + creator 30 bps (fallbacks).
-const FEE_BPS = 125n;
+// (Kept for reference: exits no longer price positions, they hold to
+// completion, so no sell-value math is needed on the hot path.)
 
 interface Coin {
   mint: Pubkey;
@@ -85,17 +83,7 @@ interface Coin {
 
 interface Held {
   openedSlot: number;
-  txPaid: bigint;
-  best: bigint;
-  tookTp1: boolean;
   devSoldAtOpen: boolean;
-}
-
-/** What selling `tokens` against (vq, vt) pays after curve fees. */
-function sellValue(tokens: bigint, vq: bigint, vt: bigint): bigint {
-  if (tokens <= 0n || vt <= 0n) return 0n;
-  const out = (tokens * vq) / (vt + tokens);
-  return out - (out * FEE_BPS + BPS - 1n) / BPS;
 }
 
 function hasPending(state: BotState, mint: Pubkey, side: 'buy' | 'sell'): boolean {
@@ -160,33 +148,18 @@ await runBot({
     }
 
     // ---- fold fills into held-position bookkeeping -----------------------
-    const marks = new Map<Pubkey, { vq: bigint; vt: bigint }>();
-    for (const m of batch.marks) {
-      marks.set(m.mint, {
-        vq: BigInt(m.virtual_quote_reserves),
-        vt: BigInt(m.virtual_token_reserves),
-      });
-    }
     for (const f of batch.fills) {
       if (f.client_id.startsWith('_')) {
         held.delete(f.mint);
         registry.selling.delete(f.mint);
         continue;
       }
-      if (f.status !== 'filled') continue;
-      if (f.side === 'buy') {
-        if (!held.has(f.mint)) {
-          held.set(f.mint, {
-            openedSlot: f.slot,
-            txPaid: BigInt(f.tx_fee_lamports),
-            best: 0n,
-            tookTp1: false,
-            devSoldAtOpen: registry.coins.get(f.mint)?.devSold ?? false,
-          });
-        }
-      } else {
-        const h = held.get(f.mint);
-        if (h !== undefined) h.txPaid += BigInt(f.tx_fee_lamports);
+      if (f.status !== 'filled' || f.side !== 'buy') continue;
+      if (!held.has(f.mint)) {
+        held.set(f.mint, {
+          openedSlot: f.slot,
+          devSoldAtOpen: registry.coins.get(f.mint)?.devSold ?? false,
+        });
       }
     }
     for (const mint of [...registry.selling]) {
@@ -203,6 +176,9 @@ await runBot({
     }
 
     // ---- exits first ------------------------------------------------------
+    // Only two exits: the creator sells while we hold (a rug signal), or the
+    // absolute max hold frees the slot. Everything else is held toward
+    // completion, where the harness closes the position for us.
     for (const [mint, pos] of state.positions) {
       if (orders.length >= cap) break;
       if (registry.selling.has(mint)) continue;
@@ -211,48 +187,12 @@ await runBot({
       if (h === undefined) {
         h = {
           openedSlot: state.slot,
-          txPaid: tx,
-          best: 0n,
-          tookTp1: false,
           devSoldAtOpen: c?.devSold ?? false,
         };
         held.set(mint, h);
       }
-      let mk = marks.get(mint);
-      if (mk === undefined) {
-        const cv = state.curves.get(mint);
-        if (cv === undefined) continue;
-        mk = { vq: cv.virtual_quote_reserves, vt: cv.virtual_token_reserves };
-      }
-      const value = sellValue(pos.token_amount, mk.vq, mk.vt) - tx;
-      const basis = pos.cost_lamports + h.txPaid;
-      if (basis <= 0n) continue;
-      if (value > h.best) h.best = value;
-
-      // Staged take-profit: bank half at +100%, keep riding the rest.
-      if (!h.tookTp1 && value * BPS >= basis * (BPS + TP1_BPS)) {
-        const part = (pos.token_amount * TP1_PART_BPS) / BPS;
-        if (part > 0n && part < pos.token_amount) {
-          orders.push({ side: 'sell', mint, token_amount: part, max_slippage_bps: SELL_SLIPPAGE_BPS });
-          registry.selling.add(mint);
-          h.tookTp1 = true;
-          h.best = 0n;
-          continue;
-        }
-      }
-
       let exit = false;
-      if (value * BPS <= basis * (BPS - HARD_STOP_BPS)) exit = true;
-      if (
-        h.best * BPS >= basis * (BPS + TRAIL_ARM_BPS) &&
-        value * BPS <= h.best * (BPS - TRAIL_BPS)
-      ) {
-        exit = true;
-      }
-      if (c !== undefined) {
-        if (c.devSold && !h.devSoldAtOpen) exit = true;
-        if (state.slot - c.lastTradeSlot >= STALE_SLOTS) exit = true;
-      }
+      if (c !== undefined && c.devSold && !h.devSoldAtOpen) exit = true;
       if (state.slot - h.openedSlot >= MAX_HOLD_SLOTS) exit = true;
       if (!exit) continue;
       orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
