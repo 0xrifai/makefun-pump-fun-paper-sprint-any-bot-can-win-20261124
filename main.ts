@@ -10,8 +10,11 @@
 //
 // Entry (all must hold, decided once per coin):
 //   - age at most MAX_ENTRY_AGE slots since creation
-//   - real SOL reserve at least MIN_RESERVE (demand has actually arrived)
-//   - at least MIN_BUYERS distinct non-creator buyers and MIN_TRADES trades
+//   - real SOL reserve at least MIN_RESERVE (demand has actually arrived:
+//     reaching 15 SOL of real reserve in a handful of trades means a crowd
+//     is buying, not one wallet; the count of distinct buyers matters less
+//     than the reserve itself, so MIN_BUYERS is low)
+//   - at least MIN_TRADES trades and MIN_BUYERS distinct non-creator buyers
 //   - the creator has not sold
 //   - others have sold at most half of what they bought, and no single sell
 //     took more than MAX_BIG_SELL_BPS of the reserve before it
@@ -19,14 +22,18 @@
 //     scales with the demand the coin has already shown
 //
 // Exits (checked every batch on every held position):
+//   - reserve trailing stop: when the real SOL reserve falls 30% from its
+//     peak since entry, the crowd is leaving — exit while value remains.
+//     Reserve is a smoothed demand signal: it only falls on net selling,
+//     so this cuts losers far earlier than a price stop, which on this data
+//     realised losses on coins that later recovered.
 //   - the creator sells while we hold -> exit at once (a rug signal)
 //   - held longer than MAX_HOLD_SLOTS -> exit and free the slot
 //   - the harness itself closes a position when its curve completes, which
 //     is the win this bot is built to catch.
-// Deliberately NO stop-loss, trailing stop, stale exit or staged
+// Deliberately NO price stop-loss, price trailing stop, stale exit or staged
 // take-profit: on this data those exits realised losses on coins that later
-// recovered and cut winners before completion. A loser held to the max hold
-// costs its stake; a winner held to completion pays many multiples of it.
+// recovered and cut winners before completion.
 //
 // Fully deterministic: slot counts only, no clock, no randomness, no I/O.
 // Slippage is left wide open (10_000 bps) so a fill is never refused for the
@@ -46,20 +53,22 @@ const SOL = LAMPORTS_PER_SOL;
 
 // ---- entry knobs ---------------------------------------------------------
 const STAKE_TARGET = 400_000_000n; // 0.4 SOL: buy min(this, size cap)
-const MIN_RESERVE = 3_000_000_000n; // 3 SOL of real reserve before entry
-const MIN_BUYERS = 5;
-const MIN_TRADES = 8;
+const MIN_RESERVE = 15_000_000_000n; // 15 SOL of real reserve before entry
+const MIN_BUYERS = 3;
+const MIN_TRADES = 5;
 const MAX_ENTRY_AGE = 1800; // slots since creation (~12 min)
 const MAX_SELL_RATIO_BPS = 5000n; // sold by others / bought, at most 50%
 const MAX_BIG_SELL_BPS = 3000n; // biggest single sell, bps of reserve
 const BUY_SLIPPAGE_BPS = 10_000;
 
 // ---- exit knobs ----------------------------------------------------------
-// v2: the v1 exits (hard stop, trailing stop, stale exit, staged take-profit)
-// destroyed value — they realised losses on coins that later recovered and
-// cut winners before completion. The only exits now are a creator sell
-// (a rug signal) and an absolute max hold that frees the slot.
-const MAX_HOLD_SLOTS = 30_000; // absolute max hold, slots (~3.3 h)
+// v3: the only exits are the reserve trailing stop (below), a creator sell
+// and an absolute max hold. v1's price stops and v2's hold-to-completion
+// both lost money on this data; the reserve trailing stop is what cut the
+// loser drag from ~-5 SOL to ~-0.3 SOL in offline replay while keeping
+// most completions.
+const RQ_TRAIL_BPS = 3000n; // exit when real reserve falls 30% from peak
+const MAX_HOLD_SLOTS = 30_000; // absolute max hold, slots (~1.8 h)
 const SELL_SLIPPAGE_BPS = 10_000;
 
 // Curve fees on a sell: protocol 95 bps + creator 30 bps (fallbacks).
@@ -84,6 +93,9 @@ interface Coin {
 interface Held {
   openedSlot: number;
   devSoldAtOpen: boolean;
+  /** Real SOL reserve at entry; the trailing stop measures against its peak. */
+  entryRq: bigint;
+  peakRq: bigint;
 }
 
 function hasPending(state: BotState, mint: Pubkey, side: 'buy' | 'sell'): boolean {
@@ -156,9 +168,12 @@ await runBot({
       }
       if (f.status !== 'filled' || f.side !== 'buy') continue;
       if (!held.has(f.mint)) {
+        const rq = registry.entryRq.get(f.mint) ?? state.curves.get(f.mint)?.real_quote_reserves ?? 0n;
         held.set(f.mint, {
           openedSlot: f.slot,
           devSoldAtOpen: registry.coins.get(f.mint)?.devSold ?? false,
+          entryRq: rq,
+          peakRq: rq,
         });
       }
     }
@@ -176,22 +191,31 @@ await runBot({
     }
 
     // ---- exits first ------------------------------------------------------
-    // Only two exits: the creator sells while we hold (a rug signal), or the
-    // absolute max hold frees the slot. Everything else is held toward
-    // completion, where the harness closes the position for us.
+    // Only three exits: the reserve trailing stop, a creator sell, and the
+    // absolute max hold. Everything else is held toward completion, where
+    // the harness closes the position for us.
     for (const [mint, pos] of state.positions) {
       if (orders.length >= cap) break;
       if (registry.selling.has(mint)) continue;
       const c = registry.coins.get(mint);
+      const curve = state.curves.get(mint);
       let h = held.get(mint);
       if (h === undefined) {
+        const rq = curve?.real_quote_reserves ?? 0n;
         h = {
           openedSlot: state.slot,
           devSoldAtOpen: c?.devSold ?? false,
+          entryRq: rq,
+          peakRq: rq,
         };
         held.set(mint, h);
       }
       let exit = false;
+      if (curve !== undefined) {
+        const rq = curve.real_quote_reserves;
+        if (rq > h.peakRq) h.peakRq = rq;
+        if (h.peakRq > 0n && rq * BPS <= h.peakRq * (BPS - RQ_TRAIL_BPS)) exit = true;
+      }
       if (c !== undefined && c.devSold && !h.devSoldAtOpen) exit = true;
       if (state.slot - h.openedSlot >= MAX_HOLD_SLOTS) exit = true;
       if (!exit) continue;
@@ -220,6 +244,7 @@ await runBot({
       if (amount < 10_000_000n) continue; // round trips must be >= 0.01 SOL
       if (free < amount + tx) continue;
       orders.push({ side: 'buy', mint: c.mint, quote_lamports: amount, max_slippage_bps: BUY_SLIPPAGE_BPS });
+      registry.entryRq.set(c.mint, curve.real_quote_reserves);
       free -= amount + tx;
       open += 1;
       c.boughtOnce = true;
@@ -235,13 +260,14 @@ function getRegistries(state: BotState): {
   coins: Map<Pubkey, Coin>;
   held: Map<Pubkey, Held>;
   selling: Set<Pubkey>;
+  entryRq: Map<Pubkey, bigint>;
 } {
   const s = state as unknown as Record<string, unknown>;
   let r = s.__rider as
-    | { coins: Map<Pubkey, Coin>; held: Map<Pubkey, Held>; selling: Set<Pubkey> }
+    | { coins: Map<Pubkey, Coin>; held: Map<Pubkey, Held>; selling: Set<Pubkey>; entryRq: Map<Pubkey, bigint> }
     | undefined;
   if (r === undefined) {
-    r = { coins: new Map(), held: new Map(), selling: new Set() };
+    r = { coins: new Map(), held: new Map(), selling: new Set(), entryRq: new Map() };
     s.__rider = r;
   }
   return r;
