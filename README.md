@@ -11,25 +11,32 @@ dependencies, no network, no randomness, fully deterministic.
 ## Strategy
 
 Most pump.fun coins die; a small share complete (migrate), and a coin bought
-early that completes is worth many multiples of its entry price. This bot
-does not scalp. It watches every launch, buys only the ones that prove
-sustained demand, then holds them toward completion:
+early that completes is worth many multiples of its entry price. But the
+dev data shows a hard constraint: 27 of the 35 completions in the frozen
+24-hour window happen in the coin's creation slot, and a bot that decides
+once per batch with 2 slots of latency can never buy those. The only
+completions a batch bot can catch are the handful that live for minutes
+(7 here). This bot is built around that fact:
 
-- **Entry (decided once per coin, within ~12 minutes of creation):** real SOL
-  reserve ≥ 5 SOL, at least 8 distinct non-creator buyers and 12 trades, the
-  creator has not sold, others have sold at most half of what they bought,
-  and no single sell took more than 30% of the reserve. The buy is
-  `min(0.4 SOL, the 1%-of-real-reserve size cap)`, so the stake scales with
-  the demand the coin has already shown. One buy per coin, no adds.
-- **Exits:** staged take-profit (sell half at +100% of basis, let the rest
-  ride), a hard stop at −40% of basis, a trailing stop (arms at +20%, exits
-  on a 30% fall from the best value), exit at once if the creator sells while
-  we hold, exit if the coin goes ~10 minutes without a trade, and an absolute
-  max hold of ~3.3 hours. The harness itself closes a position when its curve
-  completes — that is the win this bot is built to catch.
+- **Entry (decided once per coin, age 250–3600 slots):** real SOL reserve
+  ≥ 15 SOL, at least 5 trades and 3 distinct non-creator buyers. The age
+  floor is a survivorship filter — a coin still holding ≥ 15 SOL a few
+  hundred slots after creation has outlived the initial dump phase, and
+  most of the slow completions are still buyable then. There are no rug
+  filters: the slow completions show heavy selling and creator
+  profit-taking all through their run-up, so sell-ratio, biggest-sell and
+  creator-sold filters exclude exactly the coins worth catching. One buy
+  per coin, `min(0.15 SOL, the 1%-of-real-reserve size cap)`.
+- **Exits:** a reserve trailing stop (exit when the real SOL reserve falls
+  20% from its peak since entry — reserve only falls on net selling, so
+  this cuts losers while they still hold value) and an absolute max hold
+  of 8000 slots. The harness itself closes a position when its curve
+  completes — that is the win this bot is built to catch. No dev-sell
+  exit, no price stop, no take-profit, no doubling down: replay testing
+  showed every one of those cost money on this data.
 - **Fees:** every round trip pays 1.25% curve fees each way plus one
-  transaction fee per order, so the bot trades rarely and in size instead of
-  churning small fills.
+  transaction fee per order, so the bot trades rarely and in size instead
+  of churning small fills.
 - **Guardrails:** every buy is at least 0.01 SOL (the round-trip minimum),
   at most 5 positions are open at once, and the small stakes keep the
   portfolio drawdown far below the 50% limit.
